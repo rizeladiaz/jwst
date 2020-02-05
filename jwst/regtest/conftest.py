@@ -2,13 +2,15 @@ from datetime import datetime
 import os
 import copy
 import json
-import sys
 
 import getpass
 import pytest
 from ci_watson.artifactory_helpers import UPLOAD_SCHEMA
+from astropy.table import Table
+from numpy.testing import assert_allclose
 
 from .regtestdata import RegtestData
+from jwst.regtest.sdp_pools_source import SDPPoolsSource
 
 
 TODAYS_DATE = datetime.now().strftime("%Y-%m-%d")
@@ -71,36 +73,45 @@ def generate_artifactory_json(request, artifactory_repos):
 
     rtdata = postmortem(request, 'rtdata') or postmortem(request, 'rtdata_module')
     if rtdata:
-        cwd = os.path.dirname(rtdata.output)
+        try:
+            # The _jail fixture from ci_watson sets tmp_path
+            cwd = str(request.node.funcargs['tmp_path'])
+        except KeyError:
+            # The jail fixture (module-scoped) returns the path
+            cwd = str(request.node.funcargs['jail'])
         rtdata.remote_results_path = artifactory_result_path()
         rtdata.test_name = request.node.name
         # Dump the failed test traceback into rtdata
         rtdata.traceback = str(request.node.report_call.longrepr)
 
-        upload_schema_pattern.append(rtdata.input)
-        upload_schema_pattern.append(rtdata.output)
-        upload_schema = generate_upload_schema(upload_schema_pattern,
-            rtdata.remote_results_path)
+        # Upload and allow okify of truth by rtdata.output, if the test did not
+        # fail before producing rtdata.output
+        if os.path.exists(rtdata.output):
+            # Write the rtdata class out as an ASDF file
+            path_asdf = os.path.join(cwd, f"{request.node.name}_rtdata.asdf")
+            rtdata.to_asdf(path_asdf)
 
-        # Write the upload schema to JSON file
-        jsonfile = os.path.join(cwd, "{}_results.json".format(request.node.name))
-        with open(jsonfile, 'w') as outfile:
-            json.dump(upload_schema, outfile, indent=2)
+            # Generate an OKify JSON file
+            pattern = os.path.join(rtdata.remote_results_path,
+                os.path.basename(rtdata.output))
+            okify_schema_pattern.append(pattern)
+            okify_schema = generate_upload_schema(okify_schema_pattern,
+                f"{os.path.dirname(rtdata.truth_remote)}/")
 
+            jsonfile = os.path.join(cwd, f"{request.node.name}_okify.json")
+            with open(jsonfile, 'w') as fd:
+                json.dump(okify_schema, fd, indent=2)
 
-        pattern = os.path.join(rtdata.remote_results_path, os.path.basename(rtdata.output))
-        okify_schema_pattern.append(pattern)
-        okify_schema = generate_upload_schema(okify_schema_pattern, rtdata.truth_remote)
+            # Generate an upload JSON file, including the OKify, asdf file
+            upload_schema_pattern.append(rtdata.output)
+            upload_schema_pattern.append(os.path.abspath(jsonfile))
+            upload_schema_pattern.append(path_asdf)
+            upload_schema = generate_upload_schema(upload_schema_pattern,
+                rtdata.remote_results_path)
 
-        # Write the okify schema to JSON file
-        jsonfile = os.path.join(cwd, "{}_okify.json".format(request.node.name))
-        with open(jsonfile, 'w') as outfile:
-            json.dump(okify_schema, outfile, indent=2)
-
-        # Write the rtdata class out as an ASDF file
-        path = os.path.join(cwd, "{}_rtdata.asdf".format(request.node.name))
-        rtdata.to_asdf(path)
-        print(rtdata, file=sys.stderr)
+            jsonfile = os.path.join(cwd, f"{request.node.name}_results.json")
+            with open(jsonfile, 'w') as fd:
+                json.dump(upload_schema, fd, indent=2)
 
 
 def generate_upload_schema(pattern, target, recursive=False):
@@ -178,20 +189,115 @@ def _rtdata_fixture_implementation(artifactory_repos, envopt, request):
 
 
 @pytest.fixture(scope='function')
-def rtdata(artifactory_repos, envopt, request):
+def rtdata(artifactory_repos, envopt, request, _jail):
     yield from _rtdata_fixture_implementation(artifactory_repos, envopt, request)
 
 
 @pytest.fixture(scope='module')
-def rtdata_module(artifactory_repos, envopt, request):
+def rtdata_module(artifactory_repos, envopt, request, jail):
     yield from _rtdata_fixture_implementation(artifactory_repos, envopt, request)
 
 
 @pytest.fixture
 def fitsdiff_default_kwargs():
+    ignore_keywords = ['DATE', 'CAL_VER', 'CAL_VCS', 'CRDS_VER', 'CRDS_CTX',
+        'NAXIS1', 'TFORM*']
     return dict(
         ignore_hdus=['ASDF'],
-        ignore_keywords=['DATE','CAL_VER','CAL_VCS','CRDS_VER','CRDS_CTX'],
-        rtol=0.00001,
-        atol=0.0000001,
+        ignore_keywords=ignore_keywords,
+        ignore_fields=ignore_keywords,
+        rtol=1e-5,
+        atol=1e-7,
     )
+
+
+@pytest.fixture
+def diff_astropy_tables():
+    """Compare astropy tables with tolerances for float columns."""
+
+    def _diff_astropy_tables(result_path, truth_path, rtol=1e-5, atol=1e-7):
+        result = Table.read(result_path)
+        truth = Table.read(truth_path)
+
+        diffs = []
+
+        if result.colnames != truth.colnames:
+            diffs.append("Column names (or order) do not match")
+
+        if len(result) != len(truth):
+            diffs.append("Row count does not match")
+
+        # If either the columns or the row count is mismatched, then don't
+        # bother checking the individual column values.
+        if len(diffs) > 0:
+            return diffs
+
+        if result.meta != truth.meta:
+            diffs.append("Metadata does not match")
+
+        for col_name in truth.colnames:
+            try:
+                if result[col_name].dtype != truth[col_name].dtype:
+                    diffs.append(f"Column '{col_name}' dtype does not match")
+                    continue
+
+                dtype = truth[col_name].dtype
+                if dtype.kind == "f":
+                    try:
+                        assert_allclose(result[col_name], truth[col_name],
+                            rtol=rtol, atol=atol)
+                    except AssertionError as err:
+                        diffs.append(
+                            f"Column '{col_name}' values do not match (within tolerances) \n{str(err)}"
+                        )
+                else:
+                    if not (result[col_name] == truth[col_name]).all():
+                        diffs.append(f"Column '{col_name}' values do not match")
+            except AttributeError:
+                # Ignore case where a column does not have a dtype, as in the case
+                # of SkyCoord objects
+                pass
+
+        return diffs
+
+    return _diff_astropy_tables
+
+# Add option to specify a single pool name
+def pytest_addoption(parser):
+    parser.addoption(
+        '--sdp-pool', metavar='sdp_pool', default=None,
+        help='SDP test pool to run. Specify the name only, not extension or path'
+    )
+    parser.addoption(
+        '--standard-pool', metavar='standard_pool', default=None,
+        help='Standard test pool to run. Specify the name only, not extension or path'
+    )
+
+
+@pytest.fixture
+def sdp_pool(request):
+    """Retrieve a specific SDP pool to test"""
+    return request.config.getoption('--sdp-pool')
+
+
+@pytest.fixture
+def standard_pool(request):
+    """Retrieve a specific standard pool to test"""
+    return request.config.getoption('--standard-pool')
+
+
+def pytest_generate_tests(metafunc):
+    """Prefetch and parametrize a set of test pools"""
+    if 'pool_path' in metafunc.fixturenames:
+        SDPPoolsSource.inputs_root = metafunc.config.getini('inputs_root')[0]
+        SDPPoolsSource.results_root = metafunc.config.getini('results_root')[0]
+        SDPPoolsSource.env = metafunc.config.getoption('env')
+
+        pools = SDPPoolsSource()
+
+        try:
+            pool_paths = pools.pool_paths
+        except Exception:
+            pool_paths = []
+
+        metafunc.parametrize('pool_path', pool_paths)
